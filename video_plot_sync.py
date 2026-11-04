@@ -208,7 +208,8 @@ def run(args):
     filt = (f'[0:v]scale={width}:-2,setsar=1[top];'
             f'[1:v]scale={width}:-2,setsar=1[bottom];'
             f'[top][bottom]vstack=inputs=2:shortest=1[v]')
-    cmd = ['ffmpeg', '-y', '-loglevel', 'error', '-stats',
+    # 上書きの確認は main() で済ませてある．-n は念のため（その間に作られたファイルも上書きしない）
+    cmd = ['ffmpeg', '-y' if args.overwrite else '-n', '-loglevel', 'error', '-stats',
            '-filter_threads', threads, '-filter_complex_threads', threads,
            # -t: 元動画は必要な長さだけ読む（これがないと --frames で映像を短くしても
            #     音声が元動画の最後まで続き，ffmpeg が動画全体を読み続ける）
@@ -251,6 +252,17 @@ def run(args):
         raise SystemExit(f'ffmpeg failed: {args.output}')
 
 
+def check_output(video, output, overwrite):
+    """重い処理を始める前に出力先を確かめる．
+    入力と同じファイルなら常に止め，すでにあるファイルは --overwrite のときだけ上書きを許す．"""
+    same = (os.path.realpath(video) == os.path.realpath(output)
+            or (os.path.exists(output) and os.path.exists(video) and os.path.samefile(video, output)))
+    if same:
+        raise SystemExit(f'error: output is the same file as the input video: {output}')
+    if os.path.exists(output) and not overwrite:
+        raise SystemExit(f'error: {output} already exists (use --overwrite / -y to replace it)')
+
+
 def main():
     p = argparse.ArgumentParser(description='動画とプロットを縦に結合し，プロットに現在位置の赤線を引く')
     p.add_argument('--video', '-i', required=True, help='入力動画')
@@ -290,7 +302,10 @@ def main():
                         '（default: コア数の半分）')
     p.add_argument('--nice', type=int, default=10,
                    help='処理の優先度を下げる量（0〜19）．0 なら下げない（default: 10）')
+    p.add_argument('--overwrite', '-y', action='store_true',
+                   help='出力ファイルがすでにあれば上書きする（既定では止める）')
     args = p.parse_args()
+    check_output(args.video, args.output, args.overwrite)
     # 優先度と使うコアは ffmpeg（子プロセス）にも引き継がれる
     if args.nice > 0:
         os.nice(args.nice)
