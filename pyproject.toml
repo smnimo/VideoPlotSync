@@ -1,0 +1,9 @@
+[project]
+name = "videoplotsync"
+version = "0.1.0"
+description = "Stack a video and a synchronized plot (with a moving red cursor) vertically"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "matplotlib",
+]
