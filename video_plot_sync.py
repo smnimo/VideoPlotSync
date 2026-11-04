@@ -9,6 +9,7 @@ CSV は 1 行に (index, value) の組．index は動画のフレーム番号（
 import argparse
 import csv
 import json
+import os
 import subprocess
 import sys
 
@@ -203,16 +204,21 @@ def run(args):
 
     # 入力 0: 元動画，入力 1: プロットの rawvideo（stdin）を 1 回の ffmpeg で縮小して縦に結合する
     width = args.width
+    threads = str(args.threads)
     filt = (f'[0:v]scale={width}:-2,setsar=1[top];'
             f'[1:v]scale={width}:-2,setsar=1[bottom];'
             f'[top][bottom]vstack=inputs=2:shortest=1[v]')
     cmd = ['ffmpeg', '-y', '-loglevel', 'error', '-stats',
-           '-i', args.video,
+           '-filter_threads', threads, '-filter_complex_threads', threads,
+           # -t: 元動画は必要な長さだけ読む（これがないと --frames で映像を短くしても
+           #     音声が元動画の最後まで続き，ffmpeg が動画全体を読み続ける）
+           '-threads', threads, '-t', f'{duration:.6f}', '-i', args.video,
            '-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', f'{w}x{h}', '-r', str(fps), '-i', '-',
            '-filter_complex', filt, '-map', '[v]']
     if not args.no_audio:
         cmd += ['-map', '0:a?', '-c:a', 'aac']
-    cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', str(args.crf), args.output]
+    cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', str(args.crf),
+            '-threads', threads, '-shortest', args.output]
     ffmpeg = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     # 表示区間が変わるときだけ図全体を描いて背景として保存し，
@@ -279,7 +285,21 @@ def main():
     p.add_argument('--dpi', type=int, default=100)
     p.add_argument('--crf', type=int, default=23, help='x264 の画質（小さいほど高画質）')
     p.add_argument('--no-audio', action='store_true', help='音声を含めない')
-    run(p.parse_args())
+    p.add_argument('--threads', type=int, default=max(1, (os.cpu_count() or 2) // 2),
+                   help='使うコア数（ffmpeg のスレッド数もこれにそろえる）．0 なら制限しない'
+                        '（default: コア数の半分）')
+    p.add_argument('--nice', type=int, default=10,
+                   help='処理の優先度を下げる量（0〜19）．0 なら下げない（default: 10）')
+    args = p.parse_args()
+    # 優先度と使うコアは ffmpeg（子プロセス）にも引き継がれる
+    if args.nice > 0:
+        os.nice(args.nice)
+    if args.threads > 0 and hasattr(os, 'sched_setaffinity'):
+        # -threads はデコード・フィルタ・エンコードそれぞれの上限で合計は超えるので，
+        # 使えるコア自体を threads 個に絞って PC 全体が重くならないようにする
+        cpus = sorted(os.sched_getaffinity(0))
+        os.sched_setaffinity(0, cpus[:args.threads])
+    run(args)
 
 
 if __name__ == '__main__':
