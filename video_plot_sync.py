@@ -1,10 +1,13 @@
 """動画の下に，現在位置を赤線で示したプロットを縦に結合した動画を作る．
 
-CSV は 1 行に (index, value) の組．index は動画のフレーム番号（--index-unit sec なら秒）．
-ヘッダ行は自動で読み飛ばす．fps とフレーム数は省略すると ffprobe で調べる．
+CSV は 1 行に index と値の列．index は動画のフレーム番号（--index-unit sec なら秒）．
+既定では 1 列目を index，2 列目を値として 1 本描く．--cols で複数の列を選ぶと複数の系列を
+1 枚の図に描き，--right で指定した列は右の y 軸に描く（スケールの違う系列用）．
+ヘッダ行は列名として使い，数値に変換できない行は読み飛ばす．fps とフレーム数は省略すると ffprobe で調べる．
 
 例:
     python video_plot_sync.py --video in.mp4 --csv data.csv -o out.mp4
+    python video_plot_sync.py -i in.mp4 -c scores.csv --cols p_happy happy_neutral --right happy_neutral -o out.mp4
 """
 import argparse
 import csv
@@ -93,25 +96,67 @@ def probe_video(path, fps=None, frames=None):
     return fps, frames
 
 
-def load_csv(path):
-    """(index, value) の組を読む．数値に変換できない行（ヘッダなど）は飛ばす．"""
-    xs, ys = [], []
+def _is_number(s):
+    try:
+        float(s)
+    except ValueError:
+        return False
+    return True
+
+
+def read_table(path):
+    """CSV を (列名のリスト or None, 行のリスト) で返す．
+    先頭の行に数値でないセルがあれば，それを列名（ヘッダ）とみなす（ファイル名などの文字列の列があってもよい）．
+    ヘッダの行も rows に残すが，選んだ列が数値でなければ load_series で飛ばされる．"""
     with open(path, newline='') as f:
-        for row in csv.reader(f):
-            if len(row) < 2:
-                continue
-            try:
-                x, y = float(row[0]), float(row[1])
-            except ValueError:
-                continue
-            xs.append(x)
-            ys.append(y)
+        rows = [r for r in csv.reader(f) if r]
+    header = None
+    if rows and not all(_is_number(c.strip()) for c in rows[0]):
+        header = [c.strip() for c in rows[0]]
+    return header, rows
+
+
+def column_index(spec, header, path):
+    """列の指定（列名，または 0 始まりの列番号）を列番号にする．列名を優先する．"""
+    if header is not None and spec in header:
+        return header.index(spec)
+    try:
+        i = int(spec)
+    except ValueError:
+        raise SystemExit(f'error: no column "{spec}" in {path} (columns: {header})')
+    if header is not None and not 0 <= i < len(header):
+        raise SystemExit(f'error: no column {i} in {path} (columns: {header})')
+    return i
+
+
+def load_series(path, index_col, col):
+    """index 列と値の列を読む．どちらかが数値でない行（ヘッダ，空欄など）は飛ばす．"""
+    header, rows = read_table(path)
+    ix = column_index(index_col, header, path)
+    iy = column_index(col, header, path)
+    xs, ys = [], []
+    for row in rows:
+        if len(row) <= max(ix, iy):
+            continue
+        try:
+            x, y = float(row[ix]), float(row[iy])
+        except ValueError:
+            continue
+        xs.append(x)
+        ys.append(y)
     if not xs:
-        raise ValueError(f'no numeric (index, value) rows in {path}')
+        raise ValueError(f'no numeric rows of columns ({index_col}, {col}) in {path}')
     x = np.array(xs)
     y = np.array(ys)
     order = np.argsort(x, kind='stable')
-    return x[order], y[order]
+    name = header[iy] if header is not None and iy < len(header) else f'column {iy}'
+    return x[order], y[order], name
+
+
+def load_csv(path):
+    """(index, value) の組を読む（1 列目と 2 列目）．数値に変換できない行（ヘッダなど）は飛ばす．"""
+    x, y, _ = load_series(path, '0', '1')
+    return x, y
 
 
 def window_bounds(x, win):
@@ -148,34 +193,111 @@ def smooth_median(x, y, win, chunk=8192):
     return out
 
 
-def make_figure(args, x, y):
+def y_limits(ys, ymin, ymax, invert):
+    """系列の値（のリスト）から y 軸の範囲を決める．ymin / ymax が与えられればそれを使う．"""
+    allv = np.concatenate([np.asarray(y, dtype=float) for y in ys])
+    if ymin is not None or ymax is not None:
+        ylo = ymin if ymin is not None else np.nanmin(allv)
+        yhi = ymax if ymax is not None else np.nanmax(allv)
+    else:
+        ylo, yhi = np.nanmin(allv), np.nanmax(allv)
+        margin = (yhi - ylo) * 0.05 or 1.0
+        ylo, yhi = ylo - margin, yhi + margin
+    return (yhi, ylo) if invert else (ylo, yhi)
+
+
+def plot_line(ax, x, y, gap, **kw):
+    """--gap 秒以上データが抜けているところは線を切って描く．"""
+    if gap > 0:
+        breaks = np.where(np.diff(x) > gap)[0] + 1
+        x, y = np.insert(x, breaks, np.nan), np.insert(y, breaks, np.nan)
+    return ax.plot(x, y, **kw)[0]
+
+
+def make_figure(args, series):
+    """series: [(x, y, label, side)]．side は 'left' か 'right'（右の y 軸）．
+    系列が 1 本だけなら従来どおり青で描き，凡例は付けない．"""
     fig, ax = plt.subplots(figsize=(args.fig_width, args.fig_height), dpi=args.dpi)
     ax.grid()
     ax.set_xlabel('seconds', fontsize=12)
-    if args.ylabel:
-        ax.set_ylabel(args.ylabel, fontsize=12)
     if args.title:
         ax.set_title(args.title)
 
-    if args.ymin is not None or args.ymax is not None:
-        ylo = args.ymin if args.ymin is not None else np.nanmin(y)
-        yhi = args.ymax if args.ymax is not None else np.nanmax(y)
-    else:
-        ylo, yhi = np.nanmin(y), np.nanmax(y)
-        margin = (yhi - ylo) * 0.05 or 1.0
-        ylo, yhi = ylo - margin, yhi + margin
-    ax.set_ylim((yhi, ylo) if args.invert_y else (ylo, yhi))
+    left = [k for k, s in enumerate(series) if s[3] == 'left']
+    right = [k for k, s in enumerate(series) if s[3] == 'right']
+    if not left:
+        raise SystemExit('error: all the series are on the right axis; plot at least one on the left')
+    ax2 = ax.twinx() if right else None
 
-    # --gap 秒以上データが抜けているところは線を切る
-    if args.gap > 0:
-        breaks = np.where(np.diff(x) > args.gap)[0] + 1
-        ax.plot(np.insert(x, breaks, np.nan), np.insert(y, breaks, np.nan), color='blue')
-    else:
-        ax.plot(x, y, color='blue')
+    colors = (args.colors or []) + plt.rcParams['axes.prop_cycle'].by_key()['color']
+    if len(series) == 1 and not args.colors:
+        colors = ['blue']
+    handles = []
+    for k, (x, y, label, side) in enumerate(series):
+        target = ax if side == 'left' else ax2
+        handles.append(plot_line(target, x, y, args.gap, color=colors[k % len(colors)], label=label))
 
+    ylo, yhi = y_limits([series[k][1] for k in left], args.ymin, args.ymax, args.invert_y)
+    ax.set_ylim(ylo, yhi)
+    if ax2 is not None:
+        ax2.set_ylim(*y_limits([series[k][1] for k in right], args.ymin_right, args.ymax_right,
+                               args.invert_y_right))
+
+    # y 軸ラベル: 指定がなければ，その軸の系列が 1 本なら系列名（色も系列に合わせる）
+    def label_axis(a, text, ks, default):
+        own = len(ks) == 1 and len(series) > 1  # 系列が複数で，この軸には 1 本だけ
+        if text is None:
+            text = series[ks[0]][2] if own else default
+        if text:
+            kw = {'color': handles[ks[0]].get_color()} if own else {}
+            a.set_ylabel(text, fontsize=12, **kw)
+    label_axis(ax, args.ylabel, left, 'value')
+    if ax2 is not None:
+        label_axis(ax2, args.ylabel_right, right, '')
+    if args.zero_line:
+        ax.axhline(0, color='gray', lw=0.8, ls=':')
+        if ax2 is not None:
+            ax2.axhline(0, color='gray', lw=0.8, ls=':')
+
+    if len(series) > 1 and args.legend != 'none':
+        ax.legend(handles=handles, loc=args.legend, fontsize=10)
+
+    # 赤線は左の軸に描く（右の軸があっても，縦線なので高さは左の範囲で足りる）
     line_red, = ax.plot([], [], color='red', lw=args.line_width, animated=True)
     fig.tight_layout()
     return fig, ax, line_red, (min(ylo, yhi), max(ylo, yhi))
+
+
+def build_series(args, fps):
+    """--csv・--cols・--right から [(x[秒], y, label, side)] を作り，平滑化をかける．"""
+    cols = args.cols or ['1']
+    right = set(args.right or [])
+    unknown = right - set(cols)
+    if unknown:
+        cols = cols + [c for c in args.right if c in unknown]  # --right だけに書いた列も描く
+    if args.labels and len(args.labels) != len(args.csv) * len(cols):
+        raise SystemExit(f'error: --labels needs {len(args.csv) * len(cols)} names '
+                         f'(CSV files x columns), got {len(args.labels)}')
+    if args.mean and args.median:
+        raise SystemExit('--mean and --median are exclusive')
+
+    series = []
+    for path in args.csv:
+        for col in cols:
+            x, y, name = load_series(path, args.index_col, col)
+            if args.index_unit == 'frame':
+                x = x / fps
+            if args.mean:
+                y = smooth_mean(x, y, args.window)
+            elif args.median:
+                y = smooth_median(x, y, args.window)
+            if len(args.csv) > 1:
+                name = f'{os.path.splitext(os.path.basename(path))[0]}: {name}'
+            series.append([x, y, name, 'right' if col in right else 'left'])
+    if args.labels:
+        for s, label in zip(series, args.labels):
+            s[2] = label
+    return [tuple(s) for s in series]
 
 
 def run(args):
@@ -188,17 +310,8 @@ def run(args):
     duration = frames / fps
     step = args.step if args.step > 0 else duration  # 1 画面に表示する秒数
 
-    x, y = load_csv(args.csv)
-    if args.index_unit == 'frame':
-        x = x / fps
-    if args.mean and args.median:
-        raise SystemExit('--mean and --median are exclusive')
-    if args.mean:
-        y = smooth_mean(x, y, args.window)
-    elif args.median:
-        y = smooth_median(x, y, args.window)
-
-    fig, ax, line_red, (ylo, yhi) = make_figure(args, x, y)
+    series = build_series(args, fps)
+    fig, ax, line_red, (ylo, yhi) = make_figure(args, series)
     fig.canvas.draw()
     w, h = fig.canvas.get_width_height()
 
@@ -266,7 +379,19 @@ def check_output(video, output, overwrite):
 def main():
     p = argparse.ArgumentParser(description='動画とプロットを縦に結合し，プロットに現在位置の赤線を引く')
     p.add_argument('--video', '-i', required=True, help='入力動画')
-    p.add_argument('--csv', '-c', required=True, help='index,value の CSV')
+    p.add_argument('--csv', '-c', required=True, nargs='+',
+                   help='index と値の列の CSV．複数を与えると，それぞれから --cols の列を描く')
+    p.add_argument('--index-col', default='0',
+                   help='index の列（列名，または 0 始まりの列番号．default: 0）')
+    p.add_argument('--cols', nargs='+', default=None,
+                   help='描く値の列（列名，または 0 始まりの列番号）．複数なら 1 枚の図に重ねる（default: 1）')
+    p.add_argument('--right', nargs='+', default=None,
+                   help='右の y 軸に描く列（--cols と同じ書き方）．スケールの違う系列用')
+    p.add_argument('--labels', nargs='+', default=None,
+                   help='凡例の名前（系列の順: CSV ごとに --cols の順）．省略すると列名')
+    p.add_argument('--colors', nargs='+', default=None, help='系列の色（matplotlib の色名など）')
+    p.add_argument('--legend', default='upper left',
+                   help='凡例の位置（matplotlib の loc）．none なら付けない（系列が 1 本なら付けない）')
     p.add_argument('--fps', type=float, default=None,
                    help='動画の fps．省略すると ffprobe で調べる')
     p.add_argument('--frames', type=int, default=None,
@@ -285,10 +410,17 @@ def main():
     p.add_argument('--window', type=float, default=1.0, help='平滑化の窓幅 [秒]')
 
     p.add_argument('--title', default='', help='プロットのタイトル')
-    p.add_argument('--ylabel', default='value', help='y 軸ラベル')
-    p.add_argument('--ymin', type=float, default=None)
-    p.add_argument('--ymax', type=float, default=None)
-    p.add_argument('--invert-y', action='store_true', help='y 軸を上下反転する')
+    p.add_argument('--ylabel', default=None,
+                   help='（左の）y 軸ラベル．省略すると value（左の系列が 1 本で系列が複数なら系列名）')
+    p.add_argument('--ymin', type=float, default=None, help='（左の）y 軸の下限')
+    p.add_argument('--ymax', type=float, default=None, help='（左の）y 軸の上限')
+    p.add_argument('--invert-y', action='store_true', help='（左の）y 軸を上下反転する')
+    p.add_argument('--ylabel-right', default=None,
+                   help='右の y 軸ラベル．省略すると，右の系列が 1 本なら系列名')
+    p.add_argument('--ymin-right', type=float, default=None, help='右の y 軸の下限')
+    p.add_argument('--ymax-right', type=float, default=None, help='右の y 軸の上限')
+    p.add_argument('--invert-y-right', action='store_true', help='右の y 軸を上下反転する')
+    p.add_argument('--zero-line', action='store_true', help='y = 0 に点線を引く（左右の軸それぞれ）')
     p.add_argument('--line-width', type=float, default=3, help='赤線の太さ')
 
     p.add_argument('--width', type=int, default=800, help='出力動画の幅 [px]')
@@ -305,6 +437,8 @@ def main():
     p.add_argument('--overwrite', '-y', action='store_true',
                    help='出力ファイルがすでにあれば上書きする（既定では止める）')
     args = p.parse_args()
+    if args.legend.lower() == 'none':
+        args.legend = 'none'
     check_output(args.video, args.output, args.overwrite)
     # 優先度と使うコアは ffmpeg（子プロセス）にも引き継がれる
     if args.nice > 0:
