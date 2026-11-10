@@ -208,6 +208,15 @@ def y_limits(ys, ymin, ymax, invert):
     return (yhi, ylo) if invert else (ylo, yhi)
 
 
+def set_y_ticks(ax, ylo, yhi, interval):
+    """interval > 0 なら，y 軸の範囲に入る interval の倍数に目盛りを付ける（0 なら matplotlib に任せる）．"""
+    if interval <= 0:
+        return
+    lo, hi = min(ylo, yhi), max(ylo, yhi)
+    start = np.ceil(lo / interval - 1e-9) * interval
+    ax.set_yticks(np.arange(start, hi + interval * 1e-6, interval))
+
+
 # x[秒], y, 凡例の名前, 'left' / 'right'（y 軸），パネルの番号（--sub），CSV の番号，列名
 Series = namedtuple('Series', 'x y label side panel csv name')
 
@@ -246,6 +255,7 @@ def make_figure(args, series):
 
     ylo, yhi = y_limits([series[k][1] for k in left], args.ymin, args.ymax, args.invert_y)
     ax.set_ylim(ylo, yhi)
+    set_y_ticks(ax, ylo, yhi, args.ytick)
     if ax2 is not None:
         ax2.set_ylim(*y_limits([series[k][1] for k in right], args.ymin_right, args.ymax_right,
                                args.invert_y_right))
@@ -310,6 +320,7 @@ def make_subplots_figure(args, series):
             a.set_ylabel(args.ylabel, fontsize=11)
         ylo, yhi = y_limits([s.y for s in ss], args.ymin, args.ymax, args.invert_y)
         a.set_ylim(ylo, yhi)
+        set_y_ticks(a, ylo, yhi, args.ytick)
         if args.zero_line:
             a.axhline(0, color='gray', lw=0.8, ls=':')
         # 一番下の段か，下のパネルが消えている列には x 軸の目盛りとラベルを付ける
@@ -491,6 +502,8 @@ def main():
     p.add_argument('--step', type=float, default=0,
                    help='1 画面に表示する秒数．0 なら動画全体（default: 0）')
     p.add_argument('--xtick', type=float, default=0, help='x 軸目盛りの間隔 [秒]．0 なら自動')
+    p.add_argument('--ytick', type=float, default=0,
+                   help='（左の）y 軸目盛りの間隔．0 なら自動（--sub なら全パネル）')
     p.add_argument('--gap', type=float, default=0.5,
                    help='この秒数以上データが抜けている所で線を切る．0 なら全部つなぐ')
     p.add_argument('--mean', action='store_true', help='移動平均をかける')
