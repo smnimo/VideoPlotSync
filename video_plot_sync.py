@@ -3,6 +3,7 @@
 CSV は 1 行に index と値の列．index は動画のフレーム番号（--index-unit sec なら秒）．
 既定では 1 列目を index，2 列目を値として 1 本描く．--cols で複数の列を選ぶと複数の系列を
 1 枚の図に描き，--right で指定した列は右の y 軸に描く（スケールの違う系列用）．
+--sub R,C を付けると，列を重ねずに 1 列ずつ subplot(R, C, i) に並べる（赤線は全パネルで同期）．
 ヘッダ行は列名として使い，数値に変換できない行は読み飛ばす．fps とフレーム数は省略すると ffprobe で調べる．
 
 例:
@@ -15,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+from collections import namedtuple
 
 import numpy as np
 import matplotlib
@@ -206,6 +208,10 @@ def y_limits(ys, ymin, ymax, invert):
     return (yhi, ylo) if invert else (ylo, yhi)
 
 
+# x[秒], y, 凡例の名前, 'left' / 'right'（y 軸），パネルの番号（--sub），CSV の番号，列名
+Series = namedtuple('Series', 'x y label side panel csv name')
+
+
 def plot_line(ax, x, y, gap, **kw):
     """--gap 秒以上データが抜けているところは線を切って描く．"""
     if gap > 0:
@@ -215,7 +221,7 @@ def plot_line(ax, x, y, gap, **kw):
 
 
 def make_figure(args, series):
-    """series: [(x, y, label, side)]．side は 'left' か 'right'（右の y 軸）．
+    """series: [Series]．side は 'left' か 'right'（右の y 軸）．
     系列が 1 本だけなら従来どおり青で描き，凡例は付けない．"""
     fig, ax = plt.subplots(figsize=(args.fig_width, args.fig_height), dpi=args.dpi)
     ax.grid()
@@ -233,9 +239,10 @@ def make_figure(args, series):
     if len(series) == 1 and not args.colors:
         colors = ['blue']
     handles = []
-    for k, (x, y, label, side) in enumerate(series):
-        target = ax if side == 'left' else ax2
-        handles.append(plot_line(target, x, y, args.gap, color=colors[k % len(colors)], label=label))
+    for k, s in enumerate(series):
+        target = ax if s.side == 'left' else ax2
+        handles.append(plot_line(target, s.x, s.y, args.gap, color=colors[k % len(colors)],
+                                 label=s.label))
 
     ylo, yhi = y_limits([series[k][1] for k in left], args.ymin, args.ymax, args.invert_y)
     ax.set_ylim(ylo, yhi)
@@ -265,11 +272,64 @@ def make_figure(args, series):
     # 赤線は左の軸に描く（右の軸があっても，縦線なので高さは左の範囲で足りる）
     line_red, = ax.plot([], [], color='red', lw=args.line_width, animated=True)
     fig.tight_layout()
-    return fig, ax, line_red, (min(ylo, yhi), max(ylo, yhi))
+    return fig, ax, [(ax, line_red, min(ylo, yhi), max(ylo, yhi))]
+
+
+def make_subplots_figure(args, series):
+    """--sub R,C: --cols の列ごとに subplot(R, C, i) に描く（左上から横に並べる）．
+    CSV が複数なら，同じ列を各 CSV から同じパネルに重ねる（色は CSV ごと）．
+    x 軸は共有し，赤線はパネルごとに描く．余ったパネルは消す．"""
+    rows, ncols = args.sub
+    npanel = max(s.panel for s in series) + 1
+    fig, axes = plt.subplots(rows, ncols, sharex=True, squeeze=False,
+                             figsize=(args.fig_width, args.fig_height), dpi=args.dpi)
+    axes = axes.ravel()
+    for a in axes[npanel:]:
+        a.remove()
+    axes = axes[:npanel]
+    if args.title:
+        fig.suptitle(args.title)
+
+    ncsv = max(s.csv for s in series) + 1
+    colors = (args.colors or []) + plt.rcParams['axes.prop_cycle'].by_key()['color']
+    if not args.colors:
+        colors = ['blue'] if ncsv == 1 else colors
+
+    reds = []
+    legend_handles = {}
+    for p, a in enumerate(axes):
+        ss = [s for s in series if s.panel == p]
+        a.grid()
+        for s in ss:
+            # CSV が 1 つなら色はパネルごと（--colors を与えたとき），複数なら CSV ごと
+            k = (p if ncsv == 1 else s.csv) % len(colors)
+            h = plot_line(a, s.x, s.y, args.gap, color=colors[k], label=s.label)
+            legend_handles.setdefault(s.csv, h)
+        a.set_title(ss[0].name if ncsv > 1 else ss[0].label, fontsize=11)
+        if args.ylabel:
+            a.set_ylabel(args.ylabel, fontsize=11)
+        ylo, yhi = y_limits([s.y for s in ss], args.ymin, args.ymax, args.invert_y)
+        a.set_ylim(ylo, yhi)
+        if args.zero_line:
+            a.axhline(0, color='gray', lw=0.8, ls=':')
+        # 一番下の段か，下のパネルが消えている列には x 軸の目盛りとラベルを付ける
+        if p + ncols >= npanel:
+            a.xaxis.set_tick_params(labelbottom=True)
+            a.set_xlabel('seconds', fontsize=11)
+        line_red, = a.plot([], [], color='red', lw=args.line_width, animated=True)
+        reds.append((a, line_red, min(ylo, yhi), max(ylo, yhi)))
+
+    # 凡例は CSV が複数のときだけ，左上のパネルに 1 つ（色は全パネル共通なので）
+    if ncsv > 1 and args.legend != 'none':
+        axes[0].legend(handles=[legend_handles[c] for c in sorted(legend_handles)],
+                       loc=args.legend, fontsize=9)
+    fig.tight_layout()
+    return fig, axes[0], reds
 
 
 def build_series(args, fps):
-    """--csv・--cols・--right から [(x[秒], y, label, side)] を作り，平滑化をかける．"""
+    """--csv・--cols・--right から [Series] を作り，平滑化をかける．
+    --sub のときは，panel に --cols の何番目の列か（= 何番目のパネルか）を入れる．"""
     cols = args.cols or ['1']
     right = set(args.right or [])
     unknown = right - set(cols)
@@ -281,8 +341,16 @@ def build_series(args, fps):
     if args.mean and args.median:
         raise SystemExit('--mean and --median are exclusive')
 
+    if args.sub:
+        if args.right:
+            raise SystemExit('error: --right cannot be used with --sub')
+        rows, ncols = args.sub
+        if rows * ncols < len(cols):
+            raise SystemExit(f'error: --sub {rows},{ncols} has {rows * ncols} panels '
+                             f'but --cols has {len(cols)} columns')
+
     series = []
-    for path in args.csv:
+    for ci, path in enumerate(args.csv):
         for col in cols:
             x, y, name = load_series(path, args.index_col, col)
             if args.index_unit == 'frame':
@@ -291,13 +359,18 @@ def build_series(args, fps):
                 y = smooth_mean(x, y, args.window)
             elif args.median:
                 y = smooth_median(x, y, args.window)
+            stem = os.path.splitext(os.path.basename(path))[0]
+            if args.sub:
+                # パネルの名前は列名（パネルのタイトルにする），凡例は CSV ごと（ファイル名）
+                label = stem if len(args.csv) > 1 else name
+                series.append(Series(x, y, label, 'left', cols.index(col), ci, name))
+                continue
             if len(args.csv) > 1:
-                name = f'{os.path.splitext(os.path.basename(path))[0]}: {name}'
-            series.append([x, y, name, 'right' if col in right else 'left'])
+                name = f'{stem}: {name}'
+            series.append(Series(x, y, name, 'right' if col in right else 'left', 0, ci, name))
     if args.labels:
-        for s, label in zip(series, args.labels):
-            s[2] = label
-    return [tuple(s) for s in series]
+        series = [s._replace(label=label) for s, label in zip(series, args.labels)]
+    return series
 
 
 def run(args):
@@ -311,7 +384,7 @@ def run(args):
     step = args.step if args.step > 0 else duration  # 1 画面に表示する秒数
 
     series = build_series(args, fps)
-    fig, ax, line_red, (ylo, yhi) = make_figure(args, series)
+    fig, ax, reds = (make_subplots_figure if args.sub else make_figure)(args, series)
     fig.canvas.draw()
     w, h = fig.canvas.get_width_height()
 
@@ -351,8 +424,9 @@ def run(args):
                 background = fig.canvas.copy_from_bbox(fig.bbox)
                 current = j
             fig.canvas.restore_region(background)
-            line_red.set_data([t, t], [ylo, yhi])
-            ax.draw_artist(line_red)
+            for a, line_red, ylo, yhi in reds:  # --sub ならパネルごとに 1 本
+                line_red.set_data([t, t], [ylo, yhi])
+                a.draw_artist(line_red)
             ffmpeg.stdin.write(fig.canvas.buffer_rgba())
     except BrokenPipeError:
         pass
@@ -363,6 +437,17 @@ def run(args):
             pass
     if ffmpeg.wait() != 0:
         raise SystemExit(f'ffmpeg failed: {args.output}')
+
+
+def parse_grid(s):
+    """--sub の 'R,C'（'RxC' も可）を (R, C) にする．"""
+    try:
+        r, c = (int(v) for v in s.lower().replace('x', ',').split(','))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'expected ROWS,COLS (e.g. 2,3), got "{s}"')
+    if r < 1 or c < 1:
+        raise argparse.ArgumentTypeError(f'ROWS and COLS must be >= 1, got "{s}"')
+    return r, c
 
 
 def check_output(video, output, overwrite):
@@ -389,6 +474,9 @@ def main():
                    help='右の y 軸に描く列（--cols と同じ書き方）．スケールの違う系列用')
     p.add_argument('--labels', nargs='+', default=None,
                    help='凡例の名前（系列の順: CSV ごとに --cols の順）．省略すると列名')
+    p.add_argument('--sub', type=parse_grid, default=None, metavar='ROWS,COLS',
+                   help='--cols の列を 1 つずつ subplot(ROWS, COLS, i) に並べて描く（例: --sub 2,3）．'
+                        'CSV が複数なら同じ列を同じパネルに重ねる．--right とは併用できない')
     p.add_argument('--colors', nargs='+', default=None, help='系列の色（matplotlib の色名など）')
     p.add_argument('--legend', default='upper left',
                    help='凡例の位置（matplotlib の loc）．none なら付けない（系列が 1 本なら付けない）')
@@ -425,7 +513,8 @@ def main():
 
     p.add_argument('--width', type=int, default=800, help='出力動画の幅 [px]')
     p.add_argument('--fig-width', type=float, default=15, help='プロットの幅 [inch]')
-    p.add_argument('--fig-height', type=float, default=4, help='プロットの高さ [inch]')
+    p.add_argument('--fig-height', type=float, default=None,
+                   help='プロットの高さ [inch]（default: 4．--sub なら 2.5 × 行数 + 0.5）')
     p.add_argument('--dpi', type=int, default=100)
     p.add_argument('--crf', type=int, default=23, help='x264 の画質（小さいほど高画質）')
     p.add_argument('--no-audio', action='store_true', help='音声を含めない')
@@ -439,6 +528,8 @@ def main():
     args = p.parse_args()
     if args.legend.lower() == 'none':
         args.legend = 'none'
+    if args.fig_height is None:
+        args.fig_height = 2.5 * args.sub[0] + 0.5 if args.sub else 4
     check_output(args.video, args.output, args.overwrite)
     # 優先度と使うコアは ffmpeg（子プロセス）にも引き継がれる
     if args.nice > 0:

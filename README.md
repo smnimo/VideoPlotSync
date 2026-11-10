@@ -96,6 +96,28 @@ python video_plot_sync.py -i face.mp4 -c a.csv b.csv --cols p logit --right logi
   --labels "A: p" "A: logit" "B: p" "B: logit" -o out.mp4
 ```
 
+**subplot に並べる**: `--sub 行数,列数` を付けると、`--cols` の列を重ねずに 1 列ずつ別のパネル（`subplot(行数, 列数, i)`、左上から横の順）に描きます。赤線はすべてのパネルで同じ時刻に動きます。
+
+```bash
+python video_plot_sync.py -i face.mp4 -c scores.csv --cols a b c d e f --sub 2,3 -o out.mp4
+```
+
+```
+┌────────┬────────┬────────┐
+│ a   ┃  │ b   ┃  │ c   ┃  │
+├────────┼────────┼────────┤
+│ d   ┃  │ e   ┃  │ f   ┃  │  ← x 軸は共通、y 軸はパネルごと
+└────────┴────────┴────────┘
+```
+
+- パネルのタイトルは列名です（CSV が 1 つなら `--labels` で変更可）。`--title` は図全体のタイトルになります。
+- パネル数が `--cols` の列数より多ければ、余ったパネルは消します（少なければエラー）。`2x3` とも書けます。
+- y 軸の範囲はパネルごとに自動で決めます。`--ymin` / `--ymax` / `--invert-y` / `--ylabel` / `--zero-line` は全パネルに同じものがかかります。
+- CSV が複数なら、同じ列を各 CSV から同じパネルに重ねます（色は CSV ごと。凡例は左上のパネルに 1 つ、名前はファイル名か `--labels`）。
+- `--colors` は、CSV が 1 つならパネルごと、複数なら CSV ごとの色になります（CSV が 1 つで `--colors` がなければ全部青）。
+- `--right` とは併用できません。
+- `--fig-height` を省略すると `2.5 × 行数 + 0.5` inch になります。
+
 色は matplotlib の既定の順（青・オレンジ・緑・赤…）で、`--colors` で変更できます。系列が 1 本のときは従来どおり青で描き、凡例は付けません。
 `--mean` / `--median` の平滑化は、すべての系列にかかります。
 
@@ -120,6 +142,7 @@ python video_plot_sync.py -i face.mp4 -c a.csv b.csv --cols p logit --right logi
 | `--right` | なし | 右の y 軸に描く列（`--cols` と同じ書き方） |
 | `--labels` | 列名 | 凡例の名前（CSV ごとに `--cols` の順） |
 | `--colors` | matplotlib の既定 | 系列の色（例: `--colors tab:orange tab:blue`） |
+| `--sub` | なし | `行数,列数`。`--cols` の列を 1 つずつ subplot に並べて描く（`--right` とは併用不可） |
 | `--legend` | `upper left` | 凡例の位置（matplotlib の `loc`）。`none` なら付けない。系列が 1 本なら付けない |
 | `--fps` | 自動 | 動画の fps（省略時は ffprobe で検出） |
 | `--frames` | 自動 | 出力するフレーム数（省略時は動画のフレーム数を検出） |
@@ -141,7 +164,7 @@ python video_plot_sync.py -i face.mp4 -c a.csv b.csv --cols p logit --right logi
 | `--zero-line` | なし | y = 0 に点線を引く（左右の軸それぞれ） |
 | `--line-width` | `3` | 赤線の太さ |
 | `--width` | `800` | 出力動画の幅 [px]。動画もプロットもこの幅にそろえる |
-| `--fig-width`, `--fig-height` | `15`, `4` | プロットの大きさ [inch]（縦横比が決まる） |
+| `--fig-width`, `--fig-height` | `15`, `4` | プロットの大きさ [inch]（縦横比が決まる）。`--sub` なら高さの既定は `2.5 × 行数 + 0.5` |
 | `--dpi` | `100` | プロットの解像度 |
 | `--crf` | `23` | x264 の画質（小さいほど高画質・大きいファイル） |
 | `--no-audio` | なし | 音声を含めない（既定では元動画の音声をそのまま入れる） |
@@ -169,5 +192,6 @@ python video_plot_sync.py -i face.mp4 -c smile.csv \
 
 - プロットは表示区間が変わるときだけ全体を描画して背景として保存し、フレームごとには背景を戻して赤線だけを描くので高速です。
 - プロットのフレームは rawvideo として ffmpeg の標準入力に流し、元動画と同じ ffmpeg の中で縮小・`vstack` で結合するので、中間ファイルは作りません。
+- `--sub` のときは `plt.subplots(sharex=True)` でパネルを作り、x 軸の表示区間は全パネルで共有します。赤線はパネルごとに 1 本ずつ描きます。
 - 右の y 軸は matplotlib の `twinx()` で作ります。赤線は左の軸に描きます（縦線なので、高さは左の軸の範囲で足ります）。
 - 出力の長さは、動画と `--frames` のうち短い方になります（音声も同じ長さで切ります）。元動画は必要な長さだけ読みます。
